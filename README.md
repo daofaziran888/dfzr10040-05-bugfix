@@ -81,5 +81,35 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 重放终态回执与回填交付
+
+重放队列的「已恢复 / 永久跳过」是终态，只能由重放终态回执确认；
+迟到回执不会覆盖已经落定的终态。实现分三层：
+
+- `app/recovery.py`：`ReplayTerminalLedger` 按 (片段, 尝试) 只确认一个终态，
+  冲突回执保留原出错片段与尝试编号；`ReplayQueue` 的终态不可被迟到动作或回执改写。
+- `app/backfill_replay.py`：回填端暂存行 + 写入凭据、领取范围、宽表幂等交付。
+  领取范围只由生效终态回执与已落地证据决定；成功终态里同一片段同一行只记一份有效回填行。
+- `app/services/{replay_queue,backfill_task}.py`：模块动作与查询入口。
+
+接口（`backend` 起服务后可直接调用）：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/api/backfill_task/staged-rows` | 登记暂存行与写入凭据（先于终态回执） |
+| POST | `/api/backfill_task/receipts` | 提交重放终态回执（成功/耗尽/永久跳过） |
+| POST | `/api/backfill_task/hold-terminal` | 暂扣某次尝试的终态确认 |
+| POST | `/api/backfill_task/resolve-terminal` | 写入证据齐全时落定唯一终态 |
+| GET | `/api/backfill_task/next-range` | 下一次可领的数据范围 |
+| POST | `/api/backfill_task/claims` | 领取后续工作（只给范围） |
+| POST | `/api/backfill_task/claims/{code}/execute` | 按领取补采/回填，宽表幂等交付 |
+| GET | `/api/backfill_task/segments/{code}/detail` | 回填详情：终态、两份回执、生效行 |
+| GET | `/api/backfill_task/segments/{code}/wide-table` | 读取宽表行明细核对行数 |
+| GET | `/api/replay_queue/receipts` | 查看终态回执（含未生效的冲突证据） |
+| GET | `/api/replay_queue/held` | 查看暂扣中的终态确认 |
+
+宽表交付按 (片段, 行标识) 去重：任一端先确认，另一端都不会再次交付；
+同一份成功回执重复投递只登记一次生效行，其余记为重复证据。
+
 领域：数据工程
 子方向：数仓与数据湖

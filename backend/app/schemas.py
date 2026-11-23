@@ -29,3 +29,36 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class ReplayReceiptPayload(BaseModel):
+    """重放终态回执：同一尝试只允许一个终态生效。"""
+    segment_code: str
+    attempt_no: int = 1
+    outcome: str
+    error_fragment: str = ""
+    row_keys: list[str] = Field(default_factory=list)
+    write_credential: str = ""
+
+
+class StagedRowsPayload(BaseModel):
+    """回填端暂存行与写入凭据。"""
+    segment_code: str
+    attempt_no: int = 1
+    row_keys: list[str] = Field(default_factory=list)
+    write_credential: str = ""
+
+
+class HoldTerminalPayload(BaseModel):
+    segment_code: str
+    attempt_no: int = 1
+    reason: str = "两份回执冲突，等待写入证据"
+
+
+class ResolveTerminalPayload(BaseModel):
+    segment_code: str
+    attempt_no: int = 1
+
+
+class ClaimPayload(BaseModel):
+    worker: str = "值班"

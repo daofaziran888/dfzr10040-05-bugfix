@@ -8,8 +8,20 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import (
+    ActionPayload,
+    ActionResult,
+    ClaimPayload,
+    EntryPayload,
+    HoldTerminalPayload,
+    PageResult,
+    ReplayReceiptPayload,
+    ResolveTerminalPayload,
+    StagedRowsPayload,
+)
 from app.services import service_for
+from app.services.backfill_task import BackfillTaskService
+from app.services.replay_queue import ReplayQueueService
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -18,6 +30,18 @@ def require_service(module: str):
     service = service_for(module)
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
+    return service
+
+
+def _backfill_service() -> BackfillTaskService:
+    service = service_for("backfill_task")
+    assert isinstance(service, BackfillTaskService)
+    return service
+
+
+def _replay_service() -> ReplayQueueService:
+    service = service_for("replay_queue")
+    assert isinstance(service, ReplayQueueService)
     return service
 
 
@@ -71,6 +95,104 @@ def export_entries(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{module}.csv"'},
     )
+
+
+@router.get("/backfill_task/next-range", response_model=dict)
+def backfill_next_range() -> dict[str, Any]:
+    """下一次可领的数据范围：由生效终态回执与已落地证据共同决定。"""
+    return _backfill_service().next_claimable_range()
+
+
+@router.get("/backfill_task/segments/{segment_code}/detail", response_model=dict)
+def backfill_segment_detail(segment_code: str) -> dict[str, Any]:
+    """回填详情：终态、两份回执与片段里已经生效的行。"""
+    return _backfill_service().segment_detail(segment_code)
+
+
+@router.get("/backfill_task/segments/{segment_code}/wide-table", response_model=dict)
+def backfill_segment_wide_table(segment_code: str) -> dict[str, Any]:
+    """读取宽表里该片段的行明细，用于核对行数。"""
+    return _backfill_service().wide_table_detail(segment_code)
+
+
+@router.post("/backfill_task/claims", response_model=dict)
+def backfill_claim(payload: ClaimPayload) -> dict[str, Any]:
+    """领取一次后续工作，只给出范围，不写宽表。"""
+    return _backfill_service().claim_next(payload.worker)
+
+
+@router.get("/backfill_task/claims/{claim_code}", response_model=dict)
+def backfill_claim_detail(claim_code: str) -> dict[str, Any]:
+    record = _backfill_service().claim_detail(claim_code)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"领取单 {claim_code} 不存在")
+    return record
+
+
+@router.post("/backfill_task/claims/{claim_code}/execute", response_model=dict)
+def backfill_claim_execute(claim_code: str) -> dict[str, Any]:
+    """按领取实际发起补采；宽表按 (片段, 行标识) 幂等交付。"""
+    return _backfill_service().execute_claim(claim_code)
+
+
+@router.post("/backfill_task/receipts", response_model=dict)
+def backfill_submit_receipt(payload: ReplayReceiptPayload) -> dict[str, Any]:
+    """接收重放终态回执；同一尝试只认一个终态，冲突回执保留证据。"""
+    return _backfill_service().submit_receipt(
+        segment_code=payload.segment_code,
+        attempt_no=payload.attempt_no,
+        outcome=payload.outcome,
+        error_fragment=payload.error_fragment,
+        row_keys=payload.row_keys,
+        write_credential=payload.write_credential,
+    )
+
+
+@router.post("/backfill_task/staged-rows", response_model=dict)
+def backfill_stage_rows(payload: StagedRowsPayload) -> dict[str, Any]:
+    """登记回填端暂存行与写入凭据，先于终态回执落定。"""
+    return _backfill_service().stage_rows(
+        segment_code=payload.segment_code,
+        attempt_no=payload.attempt_no,
+        row_keys=payload.row_keys,
+        write_credential=payload.write_credential,
+    )
+
+
+@router.post("/backfill_task/hold-terminal", response_model=dict)
+def backfill_hold_terminal(payload: HoldTerminalPayload) -> dict[str, Any]:
+    """暂扣某次尝试的终态确认，等待写入证据。"""
+    return _backfill_service().hold_terminal(
+        segment_code=payload.segment_code,
+        attempt_no=payload.attempt_no,
+        reason=payload.reason,
+    )
+
+
+@router.post("/backfill_task/resolve-terminal", response_model=dict)
+def backfill_resolve_terminal(payload: ResolveTerminalPayload) -> dict[str, Any]:
+    """写入证据齐全时落定唯一终态。"""
+    return _backfill_service().resolve_terminal(
+        segment_code=payload.segment_code,
+        attempt_no=payload.attempt_no,
+    )
+
+
+@router.get("/replay_queue/receipts", response_model=list[dict])
+def replay_receipts(segment_code: str | None = Query(default=None)) -> list[dict[str, Any]]:
+    return _replay_service().terminal_receipts(segment_code)
+
+
+@router.get("/replay_queue/held", response_model=list[dict])
+def replay_held() -> list[dict[str, Any]]:
+    return _replay_service().held_terminals()
+
+
+@router.post("/replay_queue/{entry_id}/confirm-terminal", response_model=ActionResult)
+def replay_confirm_terminal(entry_id: int) -> ActionResult:
+    service = _replay_service()
+    entry, message = service.confirm_terminal(entry_id)
+    return ActionResult(ok=entry is not None, message=message, entry=entry)
 
 
 @router.get("/{module}/{entry_id}", response_model=dict)
